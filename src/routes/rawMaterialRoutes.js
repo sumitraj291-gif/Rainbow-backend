@@ -5,8 +5,17 @@ const rawMaterialController = require("../controllers/rawMaterialController");
 // Stats
 router.get("/stats", rawMaterialController.getInventoryStats);
 
-// Materials List
+// Metadata (Categories & Units for Dropdowns)
+router.get("/metadata", rawMaterialController.getMetadata);
+
+// Materials List & Create
 router.get("/", rawMaterialController.getRawMaterials);
+router.post("/", rawMaterialController.createRawMaterial);
+router.put("/:id", rawMaterialController.updateRawMaterial);
+router.delete("/:id", rawMaterialController.deleteRawMaterial);
+
+// Stock Adjustments (+Add / -Deduct)
+router.post("/:id/adjust-stock", rawMaterialController.adjustStock);
 
 // Formulations / Recipes
 router.get("/formulations", rawMaterialController.getFormulations);

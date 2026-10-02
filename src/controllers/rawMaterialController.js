@@ -508,6 +508,361 @@ const seedRawMaterials = async (req, res) => {
     }
 };
 
+// =========================================================
+// 8. GET METADATA (CATEGORIES & UNITS)
+// =========================================================
+const getMetadata = async (req, res) => {
+    try {
+        const [categories] = await pool.query(
+            "SELECT id, name, description FROM material_categories ORDER BY name ASC"
+        );
+        const [units] = await pool.query(
+            "SELECT id, name, symbol FROM units ORDER BY name ASC"
+        );
+        res.json({
+            success: true,
+            data: { categories, units }
+        });
+    } catch (error) {
+        console.error("GET INVENTORY METADATA ERROR:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch metadata",
+            error: error.message
+        });
+    }
+};
+
+// =========================================================
+// 9. CREATE NEW RAW MATERIAL / INVENTORY ITEM
+// =========================================================
+const createRawMaterial = async (req, res) => {
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+    try {
+        let {
+            material_code,
+            material_name,
+            category_id,
+            unit_id,
+            grade,
+            minimum_stock,
+            reorder_level,
+            standard_purchase_rate,
+            initial_stock_qty,
+            batch_number,
+            location_rack
+        } = req.body;
+
+        if (!material_name || !material_name.trim()) {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: "Material name is required"
+            });
+        }
+
+        // Auto-generate code if not provided
+        if (!material_code || !material_code.trim()) {
+            const rand = Math.floor(1000 + Math.random() * 9000);
+            material_code = `RM-${Date.now().toString().slice(-4)}-${rand}`;
+        } else {
+            material_code = material_code.trim().toUpperCase();
+        }
+
+        // Default unit if not supplied (default to KG id 2 or first unit)
+        if (!unit_id) {
+            const [u] = await connection.query("SELECT id FROM units WHERE symbol = 'KG' LIMIT 1");
+            unit_id = u.length > 0 ? u[0].id : 2;
+        }
+
+        const [insertRes] = await connection.query(
+            `
+            INSERT INTO raw_materials (
+                material_code,
+                material_name,
+                category_id,
+                unit_id,
+                grade,
+                minimum_stock,
+                reorder_level,
+                standard_purchase_rate,
+                status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+            `,
+            [
+                material_code,
+                material_name.trim(),
+                category_id || null,
+                unit_id,
+                grade || null,
+                parseFloat(minimum_stock) || 0,
+                parseFloat(reorder_level) || 0,
+                parseFloat(standard_purchase_rate) || 0
+            ]
+        );
+
+        const newMaterialId = insertRes.insertId;
+        const initialQty = parseFloat(initial_stock_qty) || 0;
+
+        // If initial stock is specified, create an opening batch
+        if (initialQty > 0) {
+            const batchNum = (batch_number && batch_number.trim()) || `OPN-${Date.now().toString().slice(-6)}`;
+            const rate = parseFloat(standard_purchase_rate) || 0;
+            const today = new Date().toISOString().slice(0, 10);
+
+            const [batchRes] = await connection.query(
+                `
+                INSERT INTO material_batches (
+                    material_id,
+                    batch_number,
+                    supplier_batch_number,
+                    received_date,
+                    quantity_received,
+                    current_quantity,
+                    purchase_rate,
+                    qc_status
+                ) VALUES (?, ?, 'OPENING-STOCK', ?, ?, ?, ?, 'APPROVED')
+                `,
+                [newMaterialId, batchNum, today, initialQty, initialQty, rate]
+            );
+
+            // Log in stock transactions
+            await connection.query(
+                `
+                INSERT INTO stock_transactions (
+                    material_id,
+                    batch_id,
+                    transaction_type,
+                    reference_type,
+                    quantity,
+                    transaction_date,
+                    remarks
+                ) VALUES (?, ?, 'ADJUSTMENT_IN', 'OPENING_STOCK', ?, NOW(), ?)
+                `,
+                [
+                    newMaterialId,
+                    batchRes.insertId,
+                    initialQty,
+                    location_rack ? `Opening balance | Location: ${location_rack}` : "Initial opening inventory balance"
+                ]
+            );
+        }
+
+        await connection.commit();
+
+        res.status(201).json({
+            success: true,
+            message: `Material "${material_name}" added to inventory successfully!`,
+            data: { id: newMaterialId, material_code, material_name }
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error("CREATE RAW MATERIAL ERROR:", error);
+        res.status(500).json({
+            success: false,
+            message: error.code === "ER_DUP_ENTRY" ? "Material code already exists. Please choose another code." : "Failed to create material",
+            error: error.message
+        });
+    } finally {
+        connection.release();
+    }
+};
+
+// =========================================================
+// 10. UPDATE RAW MATERIAL
+// =========================================================
+const updateRawMaterial = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const {
+            material_name,
+            category_id,
+            unit_id,
+            grade,
+            minimum_stock,
+            reorder_level,
+            standard_purchase_rate,
+            status
+        } = req.body;
+
+        await pool.query(
+            `
+            UPDATE raw_materials SET
+                material_name = COALESCE(?, material_name),
+                category_id = COALESCE(?, category_id),
+                unit_id = COALESCE(?, unit_id),
+                grade = COALESCE(?, grade),
+                minimum_stock = COALESCE(?, minimum_stock),
+                reorder_level = COALESCE(?, reorder_level),
+                standard_purchase_rate = COALESCE(?, standard_purchase_rate),
+                status = COALESCE(?, status)
+            WHERE id = ?
+            `,
+            [
+                material_name,
+                category_id,
+                unit_id,
+                grade,
+                minimum_stock,
+                reorder_level,
+                standard_purchase_rate,
+                status,
+                id
+            ]
+        );
+
+        res.json({
+            success: true,
+            message: "Material details updated successfully"
+        });
+    } catch (error) {
+        console.error("UPDATE RAW MATERIAL ERROR:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to update material",
+            error: error.message
+        });
+    }
+};
+
+// =========================================================
+// 11. QUICK STOCK ADJUSTMENT (+ADD / -DEDUCT)
+// =========================================================
+const adjustStock = async (req, res) => {
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+    try {
+        const { id } = req.params;
+        const { type, quantity, reason, batch_number, remarks } = req.body;
+
+        const qty = parseFloat(quantity);
+        if (isNaN(qty) || qty <= 0) {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: "Please enter a valid positive quantity"
+            });
+        }
+
+        const [matRows] = await connection.query("SELECT * FROM raw_materials WHERE id = ?", [id]);
+        if (matRows.length === 0) {
+            await connection.rollback();
+            return res.status(404).json({ success: false, message: "Material not found" });
+        }
+        const material = matRows[0];
+
+        if (type === "ADD") {
+            // Create a new batch or add to existing batch
+            const batchNum = (batch_number && batch_number.trim()) || `ADJ-${Date.now().toString().slice(-6)}`;
+            const today = new Date().toISOString().slice(0, 10);
+            const rate = material.standard_purchase_rate || 0;
+
+            const [batchRes] = await connection.query(
+                `
+                INSERT INTO material_batches (
+                    material_id, batch_number, received_date,
+                    quantity_received, current_quantity, purchase_rate, qc_status
+                ) VALUES (?, ?, ?, ?, ?, ?, 'APPROVED')
+                `,
+                [id, batchNum, today, qty, qty, rate]
+            );
+
+            await connection.query(
+                `
+                INSERT INTO stock_transactions (
+                    material_id, batch_id, transaction_type, reference_type,
+                    quantity, transaction_date, remarks
+                ) VALUES (?, ?, 'ADJUSTMENT_IN', ?, ?, NOW(), ?)
+                `,
+                [id, batchRes.insertId, reason || "STOCK_ADJUSTMENT", qty, remarks || "Manual stock addition"]
+            );
+        } else if (type === "DEDUCT") {
+            // Deduct from available batches (FIFO)
+            const [batches] = await connection.query(
+                `SELECT id, current_quantity FROM material_batches 
+                 WHERE material_id = ? AND current_quantity > 0 AND qc_status = 'APPROVED'
+                 ORDER BY received_date ASC, id ASC`,
+                [id]
+            );
+
+            const totalAvail = batches.reduce((sum, b) => sum + parseFloat(b.current_quantity), 0);
+            if (totalAvail < qty) {
+                await connection.rollback();
+                return res.status(400).json({
+                    success: false,
+                    message: `Cannot deduct ${qty}. Only ${totalAvail} available in stock.`
+                });
+            }
+
+            let remainingToDeduct = qty;
+            for (const b of batches) {
+                if (remainingToDeduct <= 0) break;
+                const batchQty = parseFloat(b.current_quantity);
+                const deductFromThis = Math.min(batchQty, remainingToDeduct);
+
+                await connection.query(
+                    `UPDATE material_batches SET current_quantity = current_quantity - ? WHERE id = ?`,
+                    [deductFromThis, b.id]
+                );
+
+                await connection.query(
+                    `
+                    INSERT INTO stock_transactions (
+                        material_id, batch_id, transaction_type, reference_type,
+                        quantity, transaction_date, remarks
+                    ) VALUES (?, ?, 'ADJUSTMENT_OUT', ?, ?, NOW(), ?)
+                    `,
+                    [id, b.id, reason || "STOCK_ADJUSTMENT", deductFromThis, remarks || "Manual stock deduction"]
+                );
+
+                remainingToDeduct -= deductFromThis;
+            }
+        } else {
+            await connection.rollback();
+            return res.status(400).json({ success: false, message: "Type must be ADD or DEDUCT" });
+        }
+
+        await connection.commit();
+
+        res.json({
+            success: true,
+            message: `Stock successfully ${type === "ADD" ? "added" : "deducted"} for ${material.material_name}!`
+        });
+    } catch (error) {
+        await connection.rollback();
+        console.error("ADJUST STOCK ERROR:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to adjust stock",
+            error: error.message
+        });
+    } finally {
+        connection.release();
+    }
+};
+
+// =========================================================
+// 12. DELETE RAW MATERIAL
+// =========================================================
+const deleteRawMaterial = async (req, res) => {
+    try {
+        const { id } = req.params;
+        await pool.query("UPDATE raw_materials SET status = 'INACTIVE' WHERE id = ?", [id]);
+        res.json({
+            success: true,
+            message: "Material deleted successfully"
+        });
+    } catch (error) {
+        console.error("DELETE RAW MATERIAL ERROR:", error);
+        res.status(500).json({
+            success: false,
+            message: "Failed to delete material",
+            error: error.message
+        });
+    }
+};
+
 module.exports = {
     getRawMaterials,
     getInventoryStats,
@@ -515,5 +870,10 @@ module.exports = {
     getMixingBatches,
     createMixingBatch,
     issueBatchToLine,
-    seedRawMaterials
+    seedRawMaterials,
+    getMetadata,
+    createRawMaterial,
+    updateRawMaterial,
+    adjustStock,
+    deleteRawMaterial
 };
