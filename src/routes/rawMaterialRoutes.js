@@ -2,8 +2,9 @@ const express = require("express");
 const router = express.Router();
 const rawMaterialController = require("../controllers/rawMaterialController");
 
-// Stats
+// Stats & 15-Day Inward/Outward Analysis
 router.get("/stats", rawMaterialController.getInventoryStats);
+router.get("/analysis", rawMaterialController.getInventoryAnalysis);
 
 // Metadata (Categories & Units for Dropdowns)
 router.get("/metadata", rawMaterialController.getMetadata);
